@@ -17,7 +17,10 @@ __declspec(dllexport) std::atomic<int64_t> CyberpunkVR_OsrStats[3]{};
 // surface of the made eye's previous frame may be when this frame's drawn eye cannot confirm it (cm, 0 = no limit;
 // see StillThere), [3] how far a sample may sit from a nearer surface's place in the made eye before it counts as
 // that surface's edge (made-eye pixels x100, 0 = off): see Trace.
-__declspec(dllexport) int32_t CyberpunkVR_OsrTune[4] = {30, 384, 100, 75};
+// Tuning, read every frame: [0] depth tolerance x1000 (30), [1] fill search reach (px, 384), [2] near limit for
+// what the drawn eye cannot confirm (cm, 100), [3] edge distance (px x100, 75; 0 = off), [4] inpaint mode:
+// 0 = classic 1D OSR mirror, 1 = NOVA-VR 2D Depth-Guided Bilateral Background Inpainting (DGBI, default)
+__declspec(dllexport) int32_t CyberpunkVR_OsrTune[5] = {30, 384, 100, 75, 1};
 }
 
 namespace cvr::osr {
@@ -258,6 +261,71 @@ void Inpaint(uint3 id : SV_DispatchThreadID) {
     bool found = false;
     int2 single = int2(-1, -1);
     float singleDepth = 1e30;
+
+    // NOVA-VR DGBI (Depth-Guided Bilateral Inpainting) Mode when edge.z >= 0.5:
+    // Performs 2D multi-directional radial search, strictly filters samples to the
+    // deeper background depth plane, and blends with distance-weighted bilateral kernels.
+    // Eliminates horizontal streaking and arm-tearing during strafing/rotation.
+    if (edge.z >= 0.5) {
+        float4 accumColor = 0;
+        float accumWeight = 0;
+        float minBgDepth = 1e30; // reversed-Z: smaller values are deeper (background)
+        int2 bestBgEdge = int2(-1, -1);
+
+        [loop] for (uint d = 0; d < 8; ++d) {
+            int2 dirv;
+            if (d == 0) dirv = int2(-1, 0);
+            else if (d == 1) dirv = int2(1, 0);
+            else if (d == 2) dirv = int2(0, -1);
+            else if (d == 3) dirv = int2(0, 1);
+            else if (d == 4) dirv = int2(-1, -1);
+            else if (d == 5) dirv = int2(1, -1);
+            else if (d == 6) dirv = int2(-1, 1);
+            else dirv = int2(1, 1);
+
+            const int k = Bound(p, dirv, run);
+            if (k > 0) {
+                const int2 q = p + dirv * k;
+                const float dVal = ResDepth[q];
+                if (dVal < minBgDepth) {
+                    minBgDepth = dVal;
+                    bestBgEdge = q;
+                }
+            }
+        }
+
+        if (bestBgEdge.x >= 0) {
+            const float bgDepthThreshold = minBgDepth * 1.05 + 1e-6;
+            [loop] for (uint d2 = 0; d2 < 8; ++d2) {
+                int2 dirv;
+                if (d2 == 0) dirv = int2(-1, 0);
+                else if (d2 == 1) dirv = int2(1, 0);
+                else if (d2 == 2) dirv = int2(0, -1);
+                else if (d2 == 3) dirv = int2(0, 1);
+                else if (d2 == 4) dirv = int2(-1, -1);
+                else if (d2 == 5) dirv = int2(1, -1);
+                else if (d2 == 6) dirv = int2(-1, 1);
+                else dirv = int2(1, 1);
+
+                const int k2 = Bound(p, dirv, run);
+                if (k2 > 0) {
+                    const int2 q2 = p + dirv * k2;
+                    const float dVal2 = ResDepth[q2];
+                    if (dVal2 <= bgDepthThreshold) {
+                        float dist = length(float2(dirv * k2));
+                        float w = 1.0 / (dist + 1.0);
+                        accumColor += ResColor[q2] * w;
+                        accumWeight += w;
+                    }
+                }
+            }
+        }
+
+        if (accumWeight > 1e-5) {
+            colour = accumColor / accumWeight;
+            found = true;
+        }
+    }
     [loop] for (uint axis = 0; axis < 2 && !found; ++axis) {
         const int2 step = axis == 0 ? int2(1, 0) : int2(0, 1);
         const int lo = Bound(p, -step, run), hi = Bound(p, step, run);
@@ -559,6 +627,7 @@ bool Record(const Request& q) {
     c.flags[3] = uint32_t((std::clamp)(CyberpunkVR_OsrTune[2], 0, 10000));
     c.edge[0] = float((std::clamp)(CyberpunkVR_OsrTune[3], 0, 10000)) / 100.0f;
     c.edge[1] = float(W) / (std::max)(c.d[4][1] - c.d[4][0], 1e-6f);
+    c.edge[2] = float((std::max)(0, CyberpunkVR_OsrTune[4])); // NOVA-VR inpaint mode: 0 = Classic 1D mirror, 1 = NOVA-VR 2D Bilateral Background Inpainting
     const uint32_t slot = g.slot;
     g.slot = (g.slot + 1) % kSlots;
     // two constant blocks a slot: the stereo splat and every other pass read the first, the history splat the second
